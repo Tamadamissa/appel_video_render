@@ -85,6 +85,12 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message.toString());
 
+      // 🔥 CORRECTIF : Si c'est un ping de maintien en vie, on répond et on arrête là
+      if (data.type === 'ping') {
+        ws.isAlive = true;
+        return ws.send(JSON.stringify({ type: 'pong' }));
+      }
+
       switch (data.type) {
         case 'enregistrement':
           clients.set(data.userId, ws);
