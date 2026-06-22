@@ -1,91 +1,80 @@
 import express from 'express';
-import multer from 'multer';
 import { OpenAI } from 'openai';
 import cors from 'cors';
 import fs from 'fs';
+import path from 'path';
 import 'dotenv/config';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 
 const app = express();
-
-// Configuration CORS stricte pour autoriser les connexions mobiles distantes
-app.use(cors({
-  origin: '*', 
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 app.use(express.json());
 
-// 1. Création du serveur HTTP universel (Requis pour Render)
 const server = createServer(app);
-
-// 2. Fusion du WebSocketServer sur le serveur HTTP existant
 const wss = new WebSocketServer({ server });
-
-// Configuration de Stockage Temporaire pour l'audio reçu
-const upload = multer({ dest: 'uploads/' });
-
-// Initialisation du client OpenAI (La clé sera lue depuis l'interface Render)
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- SECTION EXPRESS : RECEPTION ET TRADUCTION AUDIO ---
-app.post('/api/translate-stream', upload.single('audio'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "Aucun fichier audio reçu" });
-    }
-
-    const audioPath = req.file.path;
-    const targetLang = req.body.targetLang || 'ja';
-
-    const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(audioPath),
-      model: "whisper-1",
-    });
-
-    const texteOriginal = transcription.text;
-    
-    if (fs.existsSync(audioPath)) {
-      fs.unlinkSync(audioPath);
-    }
-
-    if (!texteOriginal.trim()) {
-      return res.json({ texteTraduit: "" });
-    }
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: `Tu es un traducteur instantané de haute précision pour appels vidéo. Traduis le message suivant directement en code de langue '${targetLang}'. Ne renvoie UNIQUEMENT que la traduction finale.` },
-        { role: "user", content: texteOriginal }
-      ],
-    });
-
-    const texteTraduit = completion.choices.message.content;
-    res.json({ texteTraduit: texteTraduit });
-
-  } catch (error) {
-    console.error("Erreur serveur traduction :", error);
-    res.status(500).json({ error: "Échec du traitement audio" });
-  }
-});
-
-// --- SECTION WEBSOCKET : SIGNALEMENT AVEC SÉCURITÉ GHOST CLIENTS ---
 const clients = new Map();
 
 wss.on('connection', (ws) => {
-  console.log('📱 Nouvel appareil connecté au WebSocket Render');
-  
-  // Variable pour vérifier si la connexion avec le téléphone est toujours vivante
+  console.log('📱 Appareil connecté en WebSocket natif');
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  ws.on('message', (message) => {
+  ws.on('message', async (message, isBinary) => {
+    // 🛠️ TRAITEMENT DES FLUX AUDIO BINAIRES
+    if (isBinary) {
+      if (!ws.callContext) return; // Ignore si aucune information d'appel n'est associée
+      
+      const { toTarget, lang } = ws.callContext;
+      const targetClient = clients.get(toTarget);
+      if (!targetClient) return;
+
+      const tempFilePath = path.join('uploads', `chunk_${Date.now()}_${ws.userId}.webm`);
+      
+      try {
+        // Écriture temporaire du buffer binaire sur le disque pour Whisper
+        fs.writeFileSync(tempFilePath, message);
+
+        // 1. Transcription Whisper
+        const transcription = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(tempFilePath),
+          model: "whisper-1",
+        });
+
+        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        if (!transcription.text.trim()) return;
+
+        // 2. Traduction GPT-4o-mini
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: `Tu es un traducteur instantané de haute précision pour appels vidéo. Traduis le message suivant directement en code de langue '${lang}'. Ne renvoie UNIQUEMENT que la traduction finale.` },
+            { role: "user", content: transcription.text }
+          ],
+        });
+
+        const texteTraduit = completion.choices[0].message.content;
+
+        // 3. Envoi de la traduction au destinataire de l'appel
+        targetClient.send(JSON.stringify({
+          type: 'translation',
+          translated: texteTraduit,
+          lang: lang
+        }));
+
+      } catch (err) {
+        console.error("Erreur traitement audio WebSocket:", err);
+        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+      }
+      return;
+    }
+
+    // 🛠️ TRAITEMENT DES MESSAGES TEXTE (SIGNALEMENT & ENREGISTREMENT)
     try {
       const data = JSON.parse(message.toString());
 
-      // 🔥 CORRECTIF : Si c'est un ping de maintien en vie, on répond et on arrête là
       if (data.type === 'ping') {
         ws.isAlive = true;
         return ws.send(JSON.stringify({ type: 'pong' }));
@@ -94,19 +83,23 @@ wss.on('connection', (ws) => {
       switch (data.type) {
         case 'enregistrement':
           clients.set(data.userId, ws);
-          ws.userId = data.userId; // Attache l'ID à la connexion
-          console.log(`🔗 Utilisateur enregistré à distance : ${data.userId}`);
+          ws.userId = data.userId;
+          console.log(`🔗 Utilisateur enregistré : ${data.userId}`);
+          break;
+
+        case 'update-audio-context':
+          // Mémorise à qui envoyer la traduction et dans quelle langue
+          ws.callContext = { toTarget: data.toTarget, lang: data.lang };
           break;
 
         case 'signalement':
           const clientCible = clients.get(data.cibleId);
           if (clientCible && clientCible.readyState === ws.OPEN) {
             clientCible.send(JSON.stringify({
+              type: 'signalement',
               senderId: data.senderId,
               payload: data.payload
             }));
-          } else {
-            console.log(`⚠️ Échec signalement : Destinataire ${data.cibleId} introuvable ou déconnecté`);
           }
           break;
       }
@@ -118,12 +111,12 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (ws.userId) {
       clients.delete(ws.userId);
-      console.log(`❌ Déconnexion à distance de : ${ws.userId}`);
+      console.log(`❌ Déconnexion de : ${ws.userId}`);
     }
   });
 });
 
-// 3. SYSTEME HEARTBEAT : Ferme les sockets morts pour éviter la saturation du serveur Render
+// Nettoyage des connexions mortes
 const interval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
@@ -131,23 +124,16 @@ const interval = setInterval(() => {
       return ws.terminate();
     }
     ws.isAlive = false;
-    ws.ping(); // Envoie un ping discret au téléphone
+    ws.ping();
   });
-}, 30000); // Toutes les 30 secondes
+}, 30000);
 
-wss.on('close', () => {
-  clearInterval(interval);
-});
+wss.on('close', () => clearInterval(interval));
 
-// 4. RÉGLAGE DU PORT DYNAMIQUE POUR RENDER
-// Render injecte une variable d'environnement 'PORT'. S'il n'y en a pas, on prend 8081 par défaut.
+// Crée le dossier uploads s'il n'existe pas
+if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
+
 const PORT = process.env.PORT || 8081;
+app.get('/', (req, res) => res.send('🚀 Serveur Abokina opérationnel !'));
+server.listen(PORT, () => console.log(`🚀 Serveur unifié sur le port : ${PORT}`));
 
-// Affiche un message de succès sur la racine du serveur
-app.get('/', (req, res) => {
-  res.send('🚀 Serveur de visioconférence Abokina opérationnel et en ligne !');
-});
-
-server.listen(PORT, () => {
-  console.log(`🚀 Serveur de production unifié Express + WS en ligne sur le port : ${PORT}`);
-});
